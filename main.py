@@ -136,24 +136,47 @@ def process_quip_document(file_path):
         with open(file_path, 'rb') as file:
             content = file.read()
         
-        # Try to decode as text (Quip documents are often base64 encoded)
+        logger.info(f"📄 Document size: {len(content)} bytes")
+        
+        # Try to decode as text first
         try:
-            # Decode base64 content
-            decoded_content = base64.b64decode(content).decode('utf-8')
-            logger.info("✅ Quip document decoded successfully")
-            return decoded_content
-        except:
-            # If not base64, try direct text
-            try:
-                text_content = content.decode('utf-8')
-                logger.info("✅ Quip document read as text")
+            text_content = content.decode('utf-8')
+            logger.info("✅ Document read as text")
+            logger.info(f"📄 Text content length: {len(text_content)}")
+            
+            # If it's HTML, try to extract text content
+            if '<html' in text_content.lower() or '<body' in text_content.lower():
+                logger.info("📄 Detected HTML content, extracting text...")
+                # Simple HTML text extraction (remove tags)
+                import re
+                clean_text = re.sub(r'<[^>]+>', '', text_content)
+                clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                logger.info(f"📄 Extracted text length: {len(clean_text)}")
+                return clean_text
+            else:
                 return text_content
-            except:
-                logger.error("❌ Could not decode Quip document")
-                return None
+                
+        except Exception as e:
+            logger.info(f"📄 UTF-8 decode failed: {str(e)}")
+            # Try base64 decode
+            try:
+                decoded_content = base64.b64decode(content).decode('utf-8')
+                logger.info("✅ Base64 decoded successfully")
+                logger.info(f"📄 Decoded content length: {len(decoded_content)}")
+                return decoded_content
+            except Exception as e2:
+                logger.error(f"❌ Base64 decode failed: {str(e2)}")
+                # Try to return raw content as string
+                try:
+                    raw_content = str(content)
+                    logger.info("✅ Returning raw content as string")
+                    return raw_content
+                except Exception as e3:
+                    logger.error(f"❌ All decode methods failed: {str(e3)}")
+                    return None
                 
     except Exception as e:
-        logger.error(f"❌ Error processing Quip document: {str(e)}")
+        logger.error(f"❌ Error processing document: {str(e)}")
         return None
 
 def transcribe_with_deepgram(audio_file_path):
@@ -200,9 +223,9 @@ def process_file_content(file_path, content_type):
             # Process as audio file
             logger.info("🎤 Processing as audio file")
             return transcribe_with_deepgram(file_path)
-        elif 'application/vnd.slack-docs' in content_type:
-            # Process as Quip document
-            logger.info("📄 Processing as Quip document")
+        elif 'application/vnd.slack-docs' in content_type or 'text/html' in content_type:
+            # Process as Quip document or HTML content
+            logger.info("📄 Processing as Quip document or HTML content")
             return process_quip_document(file_path)
         else:
             logger.error(f"❌ Unsupported content type: {content_type}")
@@ -256,7 +279,7 @@ def home():
         },
         'processed_files_count': len(processed_files),
         'duplicate_prevention': 'enabled',
-        'supported_formats': ['audio/mpeg', 'audio/wav', 'audio/mp4', 'application/vnd.slack-docs']
+        'supported_formats': ['audio/mpeg', 'audio/wav', 'audio/mp4', 'application/vnd.slack-docs', 'text/html']
     })
 
 @app.route('/status', methods=['GET'])
@@ -270,7 +293,7 @@ def status():
         'duplicate_prevention': 'enabled',
         'cleanup_hours': PROCESSED_FILES_CLEANUP_HOURS,
         'recent_files': list(processed_files.keys())[-10:],  # Last 10 processed files
-        'supported_formats': ['audio/mpeg', 'audio/wav', 'audio/mp4', 'application/vnd.slack-docs']
+        'supported_formats': ['audio/mpeg', 'audio/wav', 'audio/mp4', 'application/vnd.slack-docs', 'text/html']
     })
 
 @app.route('/slack-webhook', methods=['POST'])
@@ -324,9 +347,12 @@ def slack_webhook():
         # Step 4: Process file content (audio transcription or Quip text extraction)
         transcript = process_file_content(file_path, content_type)
         if not transcript:
+            logger.error(f"❌ Failed to process file content. Content type: {content_type}")
             return jsonify({
                 'success': False,
-                'error': 'Failed to process file content'
+                'error': f'Failed to process file content. Content type: {content_type}',
+                'content_type': content_type,
+                'file_size': file_size
             }), 400
         
         # Step 5: Mark file as processed
