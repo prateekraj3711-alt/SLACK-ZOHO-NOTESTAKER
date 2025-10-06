@@ -1,0 +1,974 @@
+#!/usr/bin/env python3
+"""
+Slack Webhook Middleware for Zapier Integration
+Processes Slack audio files and creates Zoho Desk tickets
+Uses OAuth token authentication (like zoho-call-tickets project)
+"""
+
+import os
+import json
+import logging
+import asyncio
+import aiohttp
+import tempfile
+import re
+import hashlib
+import sqlite3
+import requests
+from datetime import datetime
+from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from flask import Flask, request, jsonify
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# Configuration from environment variables
+SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN')
+ZOHO_DESK_ACCESS_TOKEN = os.getenv('ZOHO_DESK_ACCESS_TOKEN')
+ZOHO_DESK_REFRESH_TOKEN = os.getenv('ZOHO_DESK_REFRESH_TOKEN')
+ZOHO_DESK_CLIENT_ID = os.getenv('ZOHO_DESK_CLIENT_ID')
+ZOHO_DESK_CLIENT_SECRET = os.getenv('ZOHO_DESK_CLIENT_SECRET')
+ZOHO_DESK_ORG_ID = os.getenv('ZOHO_DESK_ORG_ID')
+ZOHO_DESK_DOMAIN = os.getenv('ZOHO_DESK_DOMAIN', 'desk.zoho.com')
+ZOHO_DESK_DEPARTMENT_ID = os.getenv('ZOHO_DESK_DEPARTMENT_ID')
+TRANSCRIPTION_API_KEY = os.getenv('TRANSCRIPTION_API_KEY')
+TRANSCRIPTION_PROVIDER = os.getenv('TRANSCRIPTION_PROVIDER', 'deepgram')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+
+@dataclass
+class SlackFileInfo:
+    """Data class for Slack file information"""
+    file_url: str
+    file_name: str
+    user_id: str
+    channel_id: str
+    timestamp: str
+    file_type: str
+
+@dataclass
+class TranscriptionResult:
+    """Data class for transcription results"""
+    success: bool
+    transcript: Optional[str] = None
+    error: Optional[str] = None
+    confidence: Optional[float] = None
+
+@dataclass
+class ZohoTicket:
+    """Data class for Zoho Desk ticket"""
+    ticket_id: str
+    subject: str
+    status: str
+    priority: str
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+
+class FileTracker:
+    """Tracks processed files to prevent duplicates"""
+    
+    def __init__(self, db_path="processed_files.db"):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize SQLite database for file tracking"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS processed_files (
+                    file_hash TEXT PRIMARY KEY,
+                    file_name TEXT,
+                    file_url TEXT,
+                    user_id TEXT,
+                    channel_id TEXT,
+                    processed_at TIMESTAMP,
+                    status TEXT,
+                    ticket_id TEXT
+                )
+            ''')
+            conn.commit()
+            conn.close()
+            logger.info("File tracking database initialized")
+        except Exception as e:
+            logger.error(f"Database initialization error: {str(e)}")
+    
+    def get_file_hash(self, file_url: str, file_name: str, user_id: str, channel_id: str) -> str:
+        """Generate unique hash for file identification"""
+        content = f"{file_url}_{file_name}_{user_id}_{channel_id}"
+        return hashlib.md5(content.encode()).hexdigest()
+    
+    def is_file_processed(self, file_url: str, file_name: str, user_id: str, channel_id: str) -> bool:
+        """Check if file has already been processed"""
+        try:
+            file_hash = self.get_file_hash(file_url, file_name, user_id, channel_id)
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM processed_files WHERE file_hash = ?",
+                (file_hash,)
+            )
+            result = cursor.fetchone()
+            conn.close()
+            return result is not None
+        except Exception as e:
+            logger.error(f"Error checking file status: {str(e)}")
+            return False
+    
+    def mark_file_processed(self, file_url: str, file_name: str, user_id: str, channel_id: str, status: str = "completed", ticket_id: str = None):
+        """Mark file as processed"""
+        try:
+            file_hash = self.get_file_hash(file_url, file_name, user_id, channel_id)
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO processed_files 
+                (file_hash, file_name, file_url, user_id, channel_id, processed_at, status, ticket_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (file_hash, file_name, file_url, user_id, channel_id, datetime.now().isoformat(), status, ticket_id))
+            conn.commit()
+            conn.close()
+            logger.info(f"File marked as processed: {file_name}")
+        except Exception as e:
+            logger.error(f"Error marking file as processed: {str(e)}")
+    
+    def get_processing_status(self, file_url: str, file_name: str, user_id: str, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Get processing status of a file"""
+        try:
+            file_hash = self.get_file_hash(file_url, file_name, user_id, channel_id)
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM processed_files WHERE file_hash = ?",
+                (file_hash,)
+            )
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                return {
+                    'file_hash': result[0],
+                    'file_name': result[1],
+                    'file_url': result[2],
+                    'user_id': result[3],
+                    'channel_id': result[4],
+                    'processed_at': result[5],
+                    'status': result[6],
+                    'ticket_id': result[7]
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error getting file status: {str(e)}")
+            return None
+
+class ZohoOAuthManager:
+    """Manages Zoho Desk OAuth authentication using pre-obtained tokens (like zoho-call-tickets)"""
+    
+    def __init__(self):
+        self.access_token = ZOHO_DESK_ACCESS_TOKEN
+        self.refresh_token = ZOHO_DESK_REFRESH_TOKEN
+        self.client_id = ZOHO_DESK_CLIENT_ID
+        self.client_secret = ZOHO_DESK_CLIENT_SECRET
+        self.org_id = ZOHO_DESK_ORG_ID
+        self.token_expires_at = None
+    
+    async def get_access_token(self) -> Optional[str]:
+        """Get valid access token, refreshing if necessary"""
+        try:
+            # Check if we have a valid token
+            if self.access_token and self.token_expires_at and datetime.now().timestamp() < self.token_expires_at:
+                return self.access_token
+            
+            # Need to refresh token
+            if self.refresh_token:
+                return await self._refresh_access_token()
+            else:
+                logger.error("No refresh token available")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting access token: {str(e)}")
+            return None
+    
+    async def _refresh_access_token(self) -> Optional[str]:
+        """Refresh access token using refresh token (like zoho-call-tickets)"""
+        try:
+            url = "https://accounts.zoho.com/oauth/v2/token"
+            data = {
+                'refresh_token': self.refresh_token,
+                'client_id': self.client_id,
+                'client_secret': self.client_secret,
+                'grant_type': 'refresh_token'
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, data=data) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        self.access_token = result['access_token']
+                        self.token_expires_at = datetime.now().timestamp() + result['expires_in']
+                        logger.info("Zoho access token refreshed successfully")
+                        return self.access_token
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Failed to refresh Zoho token: {response.status} - {error_text}")
+                        return None
+        except Exception as e:
+            logger.error(f"Error refreshing Zoho token: {str(e)}")
+            return None
+    
+    def get_headers(self):
+        """Get API headers with authentication (like zoho-call-tickets)"""
+        return {
+            "Authorization": f"Zoho-oauthtoken {self.access_token}",
+            "orgId": self.org_id,
+            "Content-Type": "application/json"
+        }
+
+class SlackWebhookProcessor:
+    """Main processor for handling Slack webhook requests"""
+    
+    def __init__(self):
+        self.executor = ThreadPoolExecutor(max_workers=5)
+        self.file_tracker = FileTracker()
+        self.zoho_oauth = ZohoOAuthManager()
+    
+    async def process_slack_webhook(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Process incoming Slack webhook from Zapier"""
+        try:
+            # Extract Slack file information
+            file_info = self._extract_slack_file_info(payload)
+            if not file_info:
+                return {
+                    'success': False,
+                    'error': 'Invalid payload: missing required Slack file information'
+                }
+            
+            # Check if file has already been processed
+            if self.file_tracker.is_file_processed(
+                file_info.file_url, file_info.file_name, file_info.user_id, file_info.channel_id
+            ):
+                existing_status = self.file_tracker.get_processing_status(
+                    file_info.file_url, file_info.file_name, file_info.user_id, file_info.channel_id
+                )
+                logger.info(f"File already processed: {file_info.file_name}")
+                return {
+                    'success': True,
+                    'message': 'File already processed - skipping duplicate',
+                    'file_name': file_info.file_name,
+                    'status': existing_status.get('status', 'completed'),
+                    'ticket_id': existing_status.get('ticket_id'),
+                    'processed_at': existing_status.get('processed_at'),
+                    'duplicate': True
+                }
+            
+            logger.info(f"Processing new Slack file: {file_info.file_name} from user {file_info.user_id}")
+            
+            # Mark file as being processed
+            self.file_tracker.mark_file_processed(
+                file_info.file_url, file_info.file_name, file_info.user_id, file_info.channel_id,
+                status="processing"
+            )
+            
+            # Start async processing
+            self.executor.submit(self._process_file_async, file_info)
+            
+            # Return immediate response to Zapier
+            return {
+                'success': True,
+                'message': 'File processing started',
+                'file_name': file_info.file_name,
+                'timestamp': datetime.now().isoformat(),
+                'duplicate': False
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing webhook: {str(e)}")
+            return {
+                'success': False,
+                'error': f'Processing error: {str(e)}'
+            }
+    
+    def _extract_slack_file_info(self, payload: Dict[str, Any]) -> Optional[SlackFileInfo]:
+        """Extract Slack file information from webhook payload"""
+        try:
+            # Expected payload structure from Zapier
+            file_info = payload.get('file_info', {})
+            return SlackFileInfo(
+                file_url=file_info.get('url_private'),
+                file_name=file_info.get('name', 'unknown'),
+                user_id=payload.get('user_id'),
+                channel_id=payload.get('channel_id'),
+                timestamp=payload.get('timestamp', str(datetime.now().timestamp())),
+                file_type=file_info.get('filetype', 'unknown')
+            )
+        except Exception as e:
+            logger.error(f"Error extracting file info: {str(e)}")
+            return None
+    
+    def _process_file_async(self, file_info: SlackFileInfo):
+        """Process file asynchronously in background thread"""
+        try:
+            # Run async processing in new event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self._async_process_file(file_info))
+            loop.close()
+        except Exception as e:
+            logger.error(f"Error in async processing: {str(e)}")
+    
+    async def _async_process_file(self, file_info: SlackFileInfo):
+        """Async file processing pipeline"""
+        try:
+            # Step 1: Transcribe audio directly from URL
+            transcript_result = await self._transcribe_audio_url(file_info.file_url)
+            if not transcript_result.success:
+                logger.error(f"Transcription failed: {transcript_result.error}")
+                return
+            
+            # Step 2: Extract contact information
+            contact_info = self._extract_contact_info(transcript_result.transcript)
+            
+            # Step 3: Search/create Zoho Desk ticket
+            ticket = await self._handle_zoho_desk_ticket(
+                transcript_result.transcript, contact_info, file_info
+            )
+            
+            # Step 4: Post feedback to Slack (optional)
+            if ticket:
+                await self._post_slack_feedback(file_info, ticket)
+            
+            # Mark file as completed with ticket ID
+            self.file_tracker.mark_file_processed(
+                file_info.file_url, file_info.file_name, file_info.user_id, file_info.channel_id,
+                status="completed", ticket_id=ticket.ticket_id if ticket else None
+            )
+                
+        except Exception as e:
+            logger.error(f"Error in file processing pipeline: {str(e)}")
+    
+    async def _download_slack_file(self, file_info: SlackFileInfo) -> Optional[str]:
+        """Download audio file from Slack"""
+        try:
+            headers = {
+                'Authorization': f'Bearer {SLACK_BOT_TOKEN}'
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(file_info.file_url, headers=headers) as response:
+                    if response.status == 200:
+                        # Create temporary file
+                        temp_file = tempfile.NamedTemporaryFile(
+                            delete=False, 
+                            suffix=f'.{file_info.file_type}'
+                        )
+                        temp_file.write(await response.read())
+                        temp_file.close()
+                        logger.info(f"Downloaded file: {temp_file.name}")
+                        return temp_file.name
+                    else:
+                        logger.error(f"Failed to download file: {response.status}")
+                        return None
+        except Exception as e:
+            logger.error(f"Error downloading Slack file: {str(e)}")
+            return None
+    
+    async def _transcribe_audio_url(self, audio_url: str) -> TranscriptionResult:
+        """Transcribe audio directly from URL using configured service"""
+        try:
+            if TRANSCRIPTION_PROVIDER == 'deepgram':
+                return await self._transcribe_url_with_deepgram(audio_url)
+            elif TRANSCRIPTION_PROVIDER == 'assemblyai':
+                return await self._transcribe_url_with_assemblyai(audio_url)
+            elif TRANSCRIPTION_PROVIDER == 'whisper':
+                return await self._transcribe_url_with_whisper(audio_url)
+            else:
+                return TranscriptionResult(
+                    success=False,
+                    error=f"Unsupported transcription provider: {TRANSCRIPTION_PROVIDER}"
+                )
+        except Exception as e:
+            logger.error(f"Transcription error: {str(e)}")
+            return TranscriptionResult(success=False, error=str(e))
+    
+    async def _transcribe_audio(self, audio_file_path: str) -> TranscriptionResult:
+        """Transcribe audio file using configured service (legacy method)"""
+        try:
+            if TRANSCRIPTION_PROVIDER == 'deepgram':
+                return await self._transcribe_with_deepgram(audio_file_path)
+            elif TRANSCRIPTION_PROVIDER == 'assemblyai':
+                return await self._transcribe_with_assemblyai(audio_file_path)
+            elif TRANSCRIPTION_PROVIDER == 'whisper':
+                return await self._transcribe_with_whisper(audio_file_path)
+            else:
+                return TranscriptionResult(
+                    success=False,
+                    error=f"Unsupported transcription provider: {TRANSCRIPTION_PROVIDER}"
+                )
+        except Exception as e:
+            logger.error(f"Transcription error: {str(e)}")
+            return TranscriptionResult(success=False, error=str(e))
+    
+    async def _transcribe_url_with_deepgram(self, audio_url: str) -> TranscriptionResult:
+        """Transcribe audio URL using Deepgram API"""
+        try:
+            url = "https://api.deepgram.com/v1/listen"
+            headers = {
+                'Authorization': f'Token {TRANSCRIPTION_API_KEY}',
+                'Content-Type': 'application/json'
+            }
+            
+            # Add authentication headers for Slack file access
+            auth_headers = {
+                'Authorization': f'Bearer {SLACK_BOT_TOKEN}'
+            }
+            
+            data = {
+                'url': audio_url,
+                'punctuate': 'true',
+                'smart_format': 'true'
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=data) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        transcript = result['results']['channels'][0]['alternatives'][0]['transcript']
+                        confidence = result['results']['channels'][0]['alternatives'][0]['confidence']
+                        return TranscriptionResult(
+                            success=True,
+                            transcript=transcript,
+                            confidence=confidence
+                        )
+                    else:
+                        error_text = await response.text()
+                        return TranscriptionResult(
+                            success=False,
+                            error=f"Deepgram API error: {response.status} - {error_text}"
+                        )
+        except Exception as e:
+            return TranscriptionResult(success=False, error=str(e))
+    
+    async def _transcribe_with_deepgram(self, audio_file_path: str) -> TranscriptionResult:
+        """Transcribe using Deepgram API (legacy method)"""
+        try:
+            url = "https://api.deepgram.com/v1/listen"
+            headers = {
+                'Authorization': f'Token {TRANSCRIPTION_API_KEY}',
+                'Content-Type': 'audio/*'
+            }
+            
+            with open(audio_file_path, 'rb') as audio_file:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, headers=headers, data=audio_file) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            transcript = result['results']['channels'][0]['alternatives'][0]['transcript']
+                            confidence = result['results']['channels'][0]['alternatives'][0]['confidence']
+                            return TranscriptionResult(
+                                success=True,
+                                transcript=transcript,
+                                confidence=confidence
+                            )
+                        else:
+                            error_text = await response.text()
+                            return TranscriptionResult(
+                                success=False,
+                                error=f"Deepgram API error: {response.status} - {error_text}"
+                            )
+        except Exception as e:
+            return TranscriptionResult(success=False, error=str(e))
+    
+    async def _transcribe_url_with_assemblyai(self, audio_url: str) -> TranscriptionResult:
+        """Transcribe audio URL using AssemblyAI API"""
+        try:
+            headers = {'authorization': TRANSCRIPTION_API_KEY}
+            
+            # Start transcription directly with URL
+            transcribe_url = "https://api.assemblyai.com/v2/transcript"
+            transcribe_data = {'audio_url': audio_url}
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(transcribe_url, headers=headers, json=transcribe_data) as response:
+                    if response.status == 200:
+                        transcribe_result = await response.json()
+                        transcript_id = transcribe_result['id']
+                        
+                        # Poll for completion
+                        return await self._poll_assemblyai_transcription(session, headers, transcript_id)
+                    else:
+                        error_text = await response.text()
+                        return TranscriptionResult(success=False, error=f"AssemblyAI API error: {response.status} - {error_text}")
+        except Exception as e:
+            return TranscriptionResult(success=False, error=str(e))
+    
+    async def _transcribe_with_assemblyai(self, audio_file_path: str) -> TranscriptionResult:
+        """Transcribe using AssemblyAI API (legacy method)"""
+        try:
+            # Upload file
+            upload_url = "https://api.assemblyai.com/v2/upload"
+            headers = {'authorization': TRANSCRIPTION_API_KEY}
+            
+            with open(audio_file_path, 'rb') as audio_file:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(upload_url, headers=headers, data=audio_file) as response:
+                        if response.status == 200:
+                            upload_result = await response.json()
+                            audio_url = upload_result['upload_url']
+                            
+                            # Start transcription
+                            transcribe_url = "https://api.assemblyai.com/v2/transcript"
+                            transcribe_data = {'audio_url': audio_url}
+                            
+                            async with session.post(transcribe_url, headers=headers, json=transcribe_data) as transcribe_response:
+                                if transcribe_response.status == 200:
+                                    transcribe_result = await transcribe_response.json()
+                                    transcript_id = transcribe_result['id']
+                                    
+                                    # Poll for completion
+                                    return await self._poll_assemblyai_transcription(session, headers, transcript_id)
+                                else:
+                                    return TranscriptionResult(success=False, error="Failed to start transcription")
+                        else:
+                            return TranscriptionResult(success=False, error="Failed to upload audio")
+        except Exception as e:
+            return TranscriptionResult(success=False, error=str(e))
+    
+    async def _poll_assemblyai_transcription(self, session, headers, transcript_id) -> TranscriptionResult:
+        """Poll AssemblyAI for transcription completion"""
+        poll_url = f"https://api.assemblyai.com/v2/transcript/{transcript_id}"
+        
+        while True:
+            async with session.get(poll_url, headers=headers) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    status = result['status']
+                    
+                    if status == 'completed':
+                        return TranscriptionResult(
+                            success=True,
+                            transcript=result['text'],
+                            confidence=result.get('confidence', 0.0)
+                        )
+                    elif status == 'error':
+                        return TranscriptionResult(
+                            success=False,
+                            error=result.get('error', 'Transcription failed')
+                        )
+                    else:
+                        # Still processing, wait and retry
+                        await asyncio.sleep(2)
+                else:
+                    return TranscriptionResult(success=False, error="Failed to poll transcription status")
+    
+    async def _transcribe_url_with_whisper(self, audio_url: str) -> TranscriptionResult:
+        """Transcribe audio URL using OpenAI Whisper API"""
+        try:
+            # Note: OpenAI Whisper doesn't support direct URL transcription
+            # We need to download the file first, then transcribe
+            logger.info("Whisper doesn't support URL transcription, downloading file first")
+            
+            # Download the audio file
+            headers = {'Authorization': f'Bearer {SLACK_BOT_TOKEN}'}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(audio_url, headers=headers) as response:
+                    if response.status == 200:
+                        audio_data = await response.read()
+                        
+                        # Create temporary file
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_file:
+                            temp_file.write(audio_data)
+                            temp_file_path = temp_file.name
+                        
+                        try:
+                            # Transcribe the temporary file
+                            result = await self._transcribe_with_whisper(temp_file_path)
+                            return result
+                        finally:
+                            # Clean up temporary file
+                            if os.path.exists(temp_file_path):
+                                os.remove(temp_file_path)
+                    else:
+                        return TranscriptionResult(
+                            success=False,
+                            error=f"Failed to download audio: {response.status}"
+                        )
+        except Exception as e:
+            return TranscriptionResult(success=False, error=str(e))
+    
+    async def _transcribe_with_whisper(self, audio_file_path: str) -> TranscriptionResult:
+        """Transcribe using OpenAI Whisper API (legacy method)"""
+        try:
+            url = "https://api.openai.com/v1/audio/transcriptions"
+            headers = {
+                'Authorization': f'Bearer {OPENAI_API_KEY}'
+            }
+            
+            with open(audio_file_path, 'rb') as audio_file:
+                data = aiohttp.FormData()
+                data.add_field('file', audio_file, filename='audio.mp3')
+                data.add_field('model', 'whisper-1')
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, headers=headers, data=data) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            return TranscriptionResult(
+                                success=True,
+                                transcript=result['text']
+                            )
+                        else:
+                            error_text = await response.text()
+                            return TranscriptionResult(
+                                success=False,
+                                error=f"Whisper API error: {response.status} - {error_text}"
+                            )
+        except Exception as e:
+            return TranscriptionResult(success=False, error=str(e))
+    
+    def _extract_contact_info(self, transcript: str) -> Dict[str, Optional[str]]:
+        """Extract phone number and email from transcript"""
+        contact_info = {
+            'phone': None,
+            'email': None
+        }
+        
+        try:
+            # Phone number patterns
+            phone_patterns = [
+                r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b',  # US format
+                r'\b\+?1?[-.\s]?\(?(\d{3})\)?[-.\s]?(\d{3})[-.\s]?(\d{4})\b',  # US with country code
+                r'\b\d{10}\b'  # 10 digits
+            ]
+            
+            for pattern in phone_patterns:
+                match = re.search(pattern, transcript)
+                if match:
+                    contact_info['phone'] = match.group(0)
+                    break
+            
+            # Email pattern
+            email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+            email_match = re.search(email_pattern, transcript)
+            if email_match:
+                contact_info['email'] = email_match.group(0)
+            
+            logger.info(f"Extracted contact info: {contact_info}")
+            return contact_info
+            
+        except Exception as e:
+            logger.error(f"Error extracting contact info: {str(e)}")
+            return contact_info
+    
+    async def _handle_zoho_desk_ticket(self, transcript: str, contact_info: Dict[str, Optional[str]], file_info: SlackFileInfo) -> Optional[ZohoTicket]:
+        """Handle Zoho Desk ticket creation or update"""
+        try:
+            # Search for existing ticket
+            existing_ticket = await self._search_zoho_ticket(contact_info)
+            
+            if existing_ticket:
+                # Update existing ticket
+                await self._update_zoho_ticket(existing_ticket.ticket_id, transcript, file_info)
+                return existing_ticket
+            else:
+                # Create new ticket
+                return await self._create_zoho_ticket(transcript, contact_info, file_info)
+                
+        except Exception as e:
+            logger.error(f"Error handling Zoho Desk ticket: {str(e)}")
+            return None
+    
+    async def _search_zoho_ticket(self, contact_info: Dict[str, Optional[str]]) -> Optional[ZohoTicket]:
+        """Search for existing Zoho Desk ticket by contact info"""
+        try:
+            if not contact_info.get('email') and not contact_info.get('phone'):
+                return None
+            
+            # Search by email
+            if contact_info.get('email'):
+                tickets = await self._search_tickets_by_email(contact_info['email'])
+                if tickets:
+                    return tickets[0]  # Return first match
+            
+            # Search by phone
+            if contact_info.get('phone'):
+                tickets = await self._search_tickets_by_phone(contact_info['phone'])
+                if tickets:
+                    return tickets[0]  # Return first match
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error searching Zoho tickets: {str(e)}")
+            return None
+    
+    async def _search_tickets_by_email(self, email: str) -> list:
+        """Search Zoho tickets by email"""
+        try:
+            # Get OAuth access token
+            access_token = await self.zoho_oauth.get_access_token()
+            if not access_token:
+                logger.error("No valid Zoho access token available")
+                return []
+            
+            url = f"https://{ZOHO_DESK_DOMAIN}/api/v1/tickets/search"
+            headers = self.zoho_oauth.get_headers()
+            params = {
+                'email': email,
+                'limit': 10
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, params=params) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result.get('data', [])
+                    else:
+                        logger.error(f"Zoho search error: {response.status}")
+                        return []
+        except Exception as e:
+            logger.error(f"Error searching tickets by email: {str(e)}")
+            return []
+    
+    async def _search_tickets_by_phone(self, phone: str) -> list:
+        """Search Zoho tickets by phone"""
+        try:
+            # Get OAuth access token
+            access_token = await self.zoho_oauth.get_access_token()
+            if not access_token:
+                logger.error("No valid Zoho access token available")
+                return []
+            
+            url = f"https://{ZOHO_DESK_DOMAIN}/api/v1/tickets/search"
+            headers = self.zoho_oauth.get_headers()
+            params = {
+                'phone': phone,
+                'limit': 10
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, params=params) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result.get('data', [])
+                    else:
+                        logger.error(f"Zoho search error: {response.status}")
+                        return []
+        except Exception as e:
+            logger.error(f"Error searching tickets by phone: {str(e)}")
+            return []
+    
+    async def _create_zoho_ticket(self, transcript: str, contact_info: Dict[str, Optional[str]], file_info: SlackFileInfo) -> Optional[ZohoTicket]:
+        """Create new Zoho Desk ticket"""
+        try:
+            # Get OAuth access token
+            access_token = await self.zoho_oauth.get_access_token()
+            if not access_token:
+                logger.error("No valid Zoho access token available")
+                return None
+            
+            url = f"https://{ZOHO_DESK_DOMAIN}/api/v1/tickets"
+            headers = self.zoho_oauth.get_headers()
+            
+            # Create ticket data
+            ticket_data = {
+                'subject': f'Voice Message from Slack - {file_info.file_name}',
+                'description': f'Transcription from Slack voice message:\n\n{transcript}',
+                'status': 'Open',
+                'priority': 'Medium',
+                'channel': 'Slack',
+                'source': 'Voice Message'
+            }
+            
+            # Add department if configured
+            if ZOHO_DESK_DEPARTMENT_ID:
+                ticket_data['departmentId'] = ZOHO_DESK_DEPARTMENT_ID
+            
+            # Add contact information if available
+            if contact_info.get('email'):
+                ticket_data['email'] = contact_info['email']
+            if contact_info.get('phone'):
+                ticket_data['phone'] = contact_info['phone']
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=ticket_data) as response:
+                    if response.status == 201:
+                        result = await response.json()
+                        ticket_id = result['data']['id']
+                        
+                        logger.info(f"Created Zoho ticket: {ticket_id}")
+                        return ZohoTicket(
+                            ticket_id=ticket_id,
+                            subject=ticket_data['subject'],
+                            status='Open',
+                            priority='Medium',
+                            contact_email=contact_info.get('email'),
+                            contact_phone=contact_info.get('phone')
+                        )
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Failed to create Zoho ticket: {response.status} - {error_text}")
+                        return None
+        except Exception as e:
+            logger.error(f"Error creating Zoho ticket: {str(e)}")
+            return None
+    
+    async def _update_zoho_ticket(self, ticket_id: str, transcript: str, file_info: SlackFileInfo):
+        """Update existing Zoho Desk ticket with transcript"""
+        try:
+            # Get OAuth access token
+            access_token = await self.zoho_oauth.get_access_token()
+            if not access_token:
+                logger.error("No valid Zoho access token available")
+                return
+            
+            # Add comment to existing ticket
+            url = f"https://{ZOHO_DESK_DOMAIN}/api/v1/tickets/{ticket_id}/comments"
+            headers = self.zoho_oauth.get_headers()
+            
+            comment_data = {
+                'content': f'New voice message transcription from Slack:\n\n{transcript}',
+                'isPublic': True
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=comment_data) as response:
+                    if response.status == 201:
+                        logger.info(f"Updated Zoho ticket {ticket_id} with transcript")
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Failed to update ticket: {response.status} - {error_text}")
+        except Exception as e:
+            logger.error(f"Error updating Zoho ticket: {str(e)}")
+    
+    async def _post_slack_feedback(self, file_info: SlackFileInfo, ticket: ZohoTicket):
+        """Post feedback message to Slack thread"""
+        try:
+            if not SLACK_BOT_TOKEN:
+                logger.warning("Slack bot token not configured, skipping feedback")
+                return
+            
+            url = "https://slack.com/api/chat.postMessage"
+            headers = {
+                'Authorization': f'Bearer {SLACK_BOT_TOKEN}',
+                'Content-Type': 'application/json'
+            }
+            
+            message = {
+                'channel': file_info.channel_id,
+                'text': f'✅ Transcript posted to Zoho Desk ticket #{ticket.ticket_id}',
+                'thread_ts': file_info.timestamp
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=message) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        if result.get('ok'):
+                            logger.info(f"Posted Slack feedback for ticket {ticket.ticket_id}")
+                        else:
+                            logger.error(f"Slack API error: {result.get('error')}")
+                    else:
+                        logger.error(f"Failed to post Slack feedback: {response.status}")
+        except Exception as e:
+            logger.error(f"Error posting Slack feedback: {str(e)}")
+
+# Initialize processor
+processor = SlackWebhookProcessor()
+
+@app.route('/')
+def home():
+    """Home endpoint"""
+    return jsonify({
+        'service': 'Slack Webhook Middleware',
+        'status': 'running',
+        'version': '1.0.0',
+        'endpoints': {
+            'webhook': '/webhook/slack',
+            'health': '/health'
+        }
+    })
+
+@app.route('/health')
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'services': {
+            'slack': bool(SLACK_BOT_TOKEN),
+            'zoho': bool(ZOHO_DESK_ACCESS_TOKEN and ZOHO_DESK_REFRESH_TOKEN),
+            'transcription': bool(TRANSCRIPTION_API_KEY)
+        },
+        'file_tracking': {
+            'database': 'active',
+            'duplicate_prevention': 'enabled'
+        }
+    })
+
+@app.route('/webhook/slack', methods=['POST'])
+def slack_webhook():
+    """Main webhook endpoint for Zapier integration"""
+    try:
+        # Get JSON payload
+        payload = request.get_json()
+        if not payload:
+            return jsonify({
+                'success': False,
+                'error': 'No JSON payload received'
+            }), 400
+        
+        logger.info(f"Received webhook: {json.dumps(payload, indent=2)}")
+        
+        # Process webhook asynchronously
+        result = asyncio.run(processor.process_slack_webhook(payload))
+        
+        if result['success']:
+            return jsonify(result), 200
+        else:
+            return jsonify(result), 400
+            
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'Internal server error: {str(e)}'
+        }), 500
+
+if __name__ == '__main__':
+    # Check required environment variables
+    required_vars = [
+        'SLACK_BOT_TOKEN', 
+        'ZOHO_DESK_ACCESS_TOKEN', 
+        'ZOHO_DESK_REFRESH_TOKEN',
+        'ZOHO_DESK_CLIENT_ID',
+        'ZOHO_DESK_CLIENT_SECRET',
+        'ZOHO_DESK_ORG_ID',
+        'TRANSCRIPTION_API_KEY'
+    ]
+    
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        logger.error(f"Missing required environment variables: {missing_vars}")
+        logger.error("Please set the following environment variables:")
+        for var in missing_vars:
+            logger.error(f"  {var}=your_value_here")
+        exit(1)
+    
+    logger.info("Starting Slack Webhook Middleware...")
+    logger.info(f"Transcription provider: {TRANSCRIPTION_PROVIDER}")
+    logger.info(f"Zoho Desk domain: {ZOHO_DESK_DOMAIN}")
+    
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=False)
