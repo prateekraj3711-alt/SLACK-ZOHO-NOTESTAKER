@@ -5,6 +5,7 @@ import os
 import tempfile
 import logging
 import hashlib
+import base64
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
@@ -84,10 +85,10 @@ def cleanup_old_entries():
         logger.error(f"❌ Error cleaning up old entries: {str(e)}")
         return 0
 
-def download_audio_from_slack(file_url, slack_token):
-    """Download audio file from Slack"""
+def download_file_from_slack(file_url, slack_token):
+    """Download file from Slack (audio or Quip document)"""
     try:
-        logger.info(f"📥 Downloading audio from Slack: {file_url}")
+        logger.info(f"📥 Downloading file from Slack: {file_url}")
         
         headers = {
             'Authorization': f'Bearer {slack_token}'
@@ -101,28 +102,59 @@ def download_audio_from_slack(file_url, slack_token):
             logger.info(f"📥 Content-Type: {content_type}")
             logger.info(f"📥 File size: {file_size} bytes")
             
+            # Determine file extension based on content type
             if 'audio/mpeg' in content_type:
                 ext = '.mp3'
             elif 'audio/wav' in content_type:
                 ext = '.wav'
             elif 'audio/mp4' in content_type:
                 ext = '.m4a'
+            elif 'application/vnd.slack-docs' in content_type:
+                ext = '.quip'
             else:
-                ext = '.mp3'
+                ext = '.mp3'  # Default
             
             with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
                 temp_file.write(response.content)
                 temp_file_path = temp_file.name
             
-            logger.info(f"✅ Audio downloaded successfully: {temp_file_path}")
-            return temp_file_path, file_size
+            logger.info(f"✅ File downloaded successfully: {temp_file_path}")
+            return temp_file_path, file_size, content_type
         else:
-            logger.error(f"❌ Failed to download audio: {response.status_code}")
-            return None, 0
+            logger.error(f"❌ Failed to download file: {response.status_code}")
+            return None, 0, None
             
     except Exception as e:
-        logger.error(f"❌ Error downloading audio: {str(e)}")
-        return None, 0
+        logger.error(f"❌ Error downloading file: {str(e)}")
+        return None, 0, None
+
+def process_quip_document(file_path):
+    """Process Quip document to extract text content"""
+    try:
+        logger.info("📄 Processing Quip document...")
+        
+        with open(file_path, 'rb') as file:
+            content = file.read()
+        
+        # Try to decode as text (Quip documents are often base64 encoded)
+        try:
+            # Decode base64 content
+            decoded_content = base64.b64decode(content).decode('utf-8')
+            logger.info("✅ Quip document decoded successfully")
+            return decoded_content
+        except:
+            # If not base64, try direct text
+            try:
+                text_content = content.decode('utf-8')
+                logger.info("✅ Quip document read as text")
+                return text_content
+            except:
+                logger.error("❌ Could not decode Quip document")
+                return None
+                
+    except Exception as e:
+        logger.error(f"❌ Error processing Quip document: {str(e)}")
+        return None
 
 def transcribe_with_deepgram(audio_file_path):
     """Transcribe audio using Deepgram API"""
@@ -161,6 +193,25 @@ def transcribe_with_deepgram(audio_file_path):
         logger.error(f"❌ Deepgram transcription error: {str(e)}")
         return None
 
+def process_file_content(file_path, content_type):
+    """Process file content based on type (audio or Quip)"""
+    try:
+        if 'audio/' in content_type:
+            # Process as audio file
+            logger.info("🎤 Processing as audio file")
+            return transcribe_with_deepgram(file_path)
+        elif 'application/vnd.slack-docs' in content_type:
+            # Process as Quip document
+            logger.info("📄 Processing as Quip document")
+            return process_quip_document(file_path)
+        else:
+            logger.error(f"❌ Unsupported content type: {content_type}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ Error processing file content: {str(e)}")
+        return None
+
 def send_to_zapier(transcript, metadata):
     """Send transcription data to Zapier webhook"""
     try:
@@ -196,15 +247,16 @@ def home():
     
     return jsonify({
         'status': 'running',
-        'message': 'Slack Voice to Zapier Middleware',
-        'version': '1.0.0',
+        'message': 'Slack Voice to Zapier Middleware (Supports Audio & Quip)',
+        'version': '1.1.0',
         'endpoints': {
             'slack_webhook': '/slack-webhook',
             'health': '/',
             'status': '/status'
         },
         'processed_files_count': len(processed_files),
-        'duplicate_prevention': 'enabled'
+        'duplicate_prevention': 'enabled',
+        'supported_formats': ['audio/mpeg', 'audio/wav', 'audio/mp4', 'application/vnd.slack-docs']
     })
 
 @app.route('/status', methods=['GET'])
@@ -217,12 +269,13 @@ def status():
         'processed_files_count': len(processed_files),
         'duplicate_prevention': 'enabled',
         'cleanup_hours': PROCESSED_FILES_CLEANUP_HOURS,
-        'recent_files': list(processed_files.keys())[-10:]  # Last 10 processed files
+        'recent_files': list(processed_files.keys())[-10:],  # Last 10 processed files
+        'supported_formats': ['audio/mpeg', 'audio/wav', 'audio/mp4', 'application/vnd.slack-docs']
     })
 
 @app.route('/slack-webhook', methods=['POST'])
 def slack_webhook():
-    """Handle Slack voice message webhooks with duplicate prevention"""
+    """Handle Slack file webhooks with support for audio and Quip documents"""
     try:
         data = request.get_json()
         logger.info(f"📨 Received Slack webhook: {json.dumps(data, indent=2)}")
@@ -242,12 +295,12 @@ def slack_webhook():
                 'error': 'Missing required fields'
             }), 400
         
-        # Step 1: Download audio to get file size
-        audio_file_path, file_size = download_audio_from_slack(file_url, slack_token)
-        if not audio_file_path:
+        # Step 1: Download file to get content type and size
+        file_path, file_size, content_type = download_file_from_slack(file_url, slack_token)
+        if not file_path:
             return jsonify({
                 'success': False,
-                'error': 'Failed to download audio'
+                'error': 'Failed to download file'
             }), 400
         
         # Step 2: Generate file hash for duplicate prevention
@@ -268,12 +321,12 @@ def slack_webhook():
                 'duplicate_prevention': 'triggered'
             })
         
-        # Step 4: Transcribe audio
-        transcript = transcribe_with_deepgram(audio_file_path)
+        # Step 4: Process file content (audio transcription or Quip text extraction)
+        transcript = process_file_content(file_path, content_type)
         if not transcript:
             return jsonify({
                 'success': False,
-                'error': 'Transcription failed'
+                'error': 'Failed to process file content'
             }), 400
         
         # Step 5: Mark file as processed
@@ -283,7 +336,9 @@ def slack_webhook():
             'user_name': user_name,
             'channel_name': channel_name,
             'file_url': file_url,
-            'file_hash': file_hash
+            'file_hash': file_hash,
+            'content_type': content_type,
+            'file_size': file_size
         }
         
         mark_file_processed(file_hash, transcript, metadata)
@@ -293,16 +348,17 @@ def slack_webhook():
         
         # Clean up temporary file
         try:
-            os.unlink(audio_file_path)
+            os.unlink(file_path)
         except:
             pass
         
         if zapier_success:
             return jsonify({
                 'success': True,
-                'message': 'Voice message processed and sent to Zapier',
+                'message': 'File processed and sent to Zapier',
                 'transcript': transcript,
                 'file_hash': file_hash,
+                'content_type': content_type,
                 'duplicate_prevention': 'passed'
             })
         else:
