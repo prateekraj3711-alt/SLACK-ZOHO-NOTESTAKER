@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: slack-webhook-middleware
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn slack_webhook_middleware:app --bind 0.0.0.0:$PORT --workers 4 --timeout 120
+    healthCheckPath: /health
+    envVars:
+      - key: SLACK_BOT_TOKEN
+        description: Slack Bot Token for file access and posting
+        required: true
+      - key: ZOHO_DESK_API_KEY
+        description: Zoho Desk API Key for ticket management
+        required: true
+      - key: ZOHO_DESK_ORG_ID
+        description: Zoho Desk Organization ID
+        required: true
+      - key: ZOHO_DESK_DOMAIN
+        description: Zoho Desk domain (e.g., your-domain.zohodesk.com)
+        required: true
+      - key: TRANSCRIPTION_API_KEY
+        description: Transcription service API key (Deepgram/AssemblyAI/OpenAI)
+        required: true
+      - key: TRANSCRIPTION_PROVIDER
+        description: Transcription provider (deepgram, assemblyai, whisper)
+        defaultValue: deepgram
+      - key: OPENAI_API_KEY
+        description: OpenAI API key (required if using whisper)
+        required: false
