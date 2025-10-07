@@ -56,6 +56,15 @@ class SlackFileInfo:
     channel_id: str
     timestamp: str
     file_type: str
+    is_canvas: bool = False
+    canvas_audio_links: list = None
+
+@dataclass
+class CanvasData:
+    """Data class for Canvas file information"""
+    canvas_text: str
+    audio_links: list
+    file_id: str
 
 @dataclass
 class TranscriptionResult:
@@ -237,6 +246,87 @@ class ZohoOAuthManager:
             "Content-Type": "application/json"
         }
 
+class CanvasParser:
+    """Handles Slack Canvas file parsing and audio extraction"""
+    
+    def __init__(self, slack_token: str):
+        self.slack_token = slack_token
+    
+    def download_and_parse_canvas(self, file_id: str) -> Optional[CanvasData]:
+        """Download and parse Canvas file to extract audio links"""
+        try:
+            # Step 1: Get file info
+            file_info_url = f"https://slack.com/api/files.info?file={file_id}"
+            headers = {"Authorization": f"Bearer {self.slack_token}"}
+            file_info_resp = requests.get(file_info_url, headers=headers)
+
+            if not file_info_resp.ok:
+                logger.error(f"Failed to fetch file info: {file_info_resp.text}")
+                return None
+
+            file_data = file_info_resp.json().get("file", {})
+            file_url = file_data.get("url_private_download")
+            mimetype = file_data.get("mimetype")
+
+            # Step 2: Download Canvas file
+            if not isinstance(file_url, str):
+                logger.error(f"Invalid file_url: {file_url}")
+                return None
+
+            canvas_resp = requests.get(file_url, headers=headers)
+            if not canvas_resp.ok:
+                logger.error(f"Failed to download canvas file: {canvas_resp.text}")
+                return None
+
+            canvas_content = canvas_resp.content
+
+            # Step 3: Parse Canvas blocks via canvas.info
+            canvas_info_url = f"https://slack.com/api/canvas.info?canvas_id={file_id}"
+            canvas_info_resp = requests.get(canvas_info_url, headers=headers)
+
+            if not canvas_info_resp.ok:
+                logger.error(f"Failed to fetch canvas info: {canvas_info_resp.text}")
+                return None
+
+            blocks = canvas_info_resp.json().get("canvas", {}).get("blocks", [])
+
+            audio_links = []
+            for block in blocks:
+                if block.get("type") == "rich_text":
+                    elements = block.get("elements", [])
+                    for el in elements:
+                        if el.get("type") == "link" and el.get("url", "").endswith((".mp3", ".wav", ".m4a", ".mp4")):
+                            audio_links.append(el["url"])
+                elif block.get("type") == "file":
+                    file_url = block.get("file", {}).get("url_private_download")
+                    if file_url and file_url.endswith((".mp3", ".wav", ".m4a", ".mp4")):
+                        audio_links.append(file_url)
+
+            logger.info(f"Extracted {len(audio_links)} audio links from Canvas")
+
+            return CanvasData(
+                canvas_text=canvas_content.decode("utf-8", errors="ignore"),
+                audio_links=audio_links,
+                file_id=file_id
+            )
+            
+        except Exception as e:
+            logger.error(f"Error parsing Canvas file: {str(e)}")
+            return None
+    
+    def is_canvas_file(self, file_type: str, mimetype: str = None) -> bool:
+        """Check if file is a Slack Canvas file"""
+        canvas_indicators = [
+            'canvas',
+            'application/vnd.slack.canvas',
+            'text/canvas'
+        ]
+        
+        if mimetype:
+            return any(indicator in mimetype.lower() for indicator in canvas_indicators)
+        
+        return file_type.lower() == 'canvas'
+
 class AudioConverter:
     """Handles audio file conversion from MP4 to MP3"""
     
@@ -369,6 +459,7 @@ class SlackWebhookProcessor:
         self.file_tracker = FileTracker()
         self.zoho_oauth = ZohoOAuthManager()
         self.audio_converter = AudioConverter()
+        self.canvas_parser = CanvasParser(SLACK_BOT_TOKEN)
     
     async def process_slack_webhook(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Process incoming Slack webhook from Zapier"""
@@ -431,13 +522,21 @@ class SlackWebhookProcessor:
         try:
             # Expected payload structure from Zapier
             file_info = payload.get('file_info', {})
+            file_type = file_info.get('filetype', 'unknown')
+            mimetype = file_info.get('mimetype', '')
+            
+            # Check if it's a Canvas file
+            is_canvas = self.canvas_parser.is_canvas_file(file_type, mimetype)
+            
             return SlackFileInfo(
                 file_url=file_info.get('url_private'),
                 file_name=file_info.get('name', 'unknown'),
                 user_id=payload.get('user_id'),
                 channel_id=payload.get('channel_id'),
                 timestamp=payload.get('timestamp', str(datetime.now().timestamp())),
-                file_type=file_info.get('filetype', 'unknown')
+                file_type=file_type,
+                is_canvas=is_canvas,
+                canvas_audio_links=[]
             )
         except Exception as e:
             logger.error(f"Error extracting file info: {str(e)}")
@@ -456,6 +555,110 @@ class SlackWebhookProcessor:
     
     async def _async_process_file(self, file_info: SlackFileInfo):
         """Async file processing pipeline"""
+        audio_file_path = None
+        converted_audio_path = None
+        
+        try:
+            if file_info.is_canvas:
+                # Handle Canvas file with embedded audio
+                await self._process_canvas_file(file_info)
+            else:
+                # Handle regular audio file
+                await self._process_regular_audio_file(file_info)
+            
+        except Exception as e:
+            logger.error(f"Error in file processing pipeline: {str(e)}")
+        finally:
+            # Cleanup temporary files
+            for file_path in [audio_file_path, converted_audio_path]:
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        logger.info(f"Cleaned up temporary file: {file_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to cleanup file {file_path}: {str(e)}")
+    
+    async def _process_canvas_file(self, file_info: SlackFileInfo):
+        """Process Canvas file with embedded audio"""
+        try:
+            # Extract file ID from URL or payload
+            file_id = self._extract_file_id_from_url(file_info.file_url)
+            if not file_id:
+                logger.error(f"Could not extract file ID from URL: {file_info.file_url}")
+                return
+            
+            # Parse Canvas file
+            canvas_data = self.canvas_parser.download_and_parse_canvas(file_id)
+            if not canvas_data:
+                logger.error(f"Failed to parse Canvas file: {file_info.file_name}")
+                return
+            
+            logger.info(f"Canvas file contains {len(canvas_data.audio_links)} audio files")
+            
+            # Process each audio file
+            all_transcripts = []
+            for i, audio_url in enumerate(canvas_data.audio_links):
+                try:
+                    logger.info(f"Processing audio {i+1}/{len(canvas_data.audio_links)}: {audio_url}")
+                    
+                    # Download audio file
+                    audio_file_path = await self._download_audio_from_url(audio_url, f"canvas_audio_{i}")
+                    if not audio_file_path:
+                        continue
+                    
+                    # Convert to MP3 if needed
+                    converted_path = await self._convert_audio_if_needed(audio_file_path, file_info)
+                    if not converted_path:
+                        continue
+                    
+                    # Transcribe audio
+                    transcript_result = await self._transcribe_audio(converted_path)
+                    if transcript_result.success:
+                        all_transcripts.append(transcript_result.transcript)
+                        logger.info(f"Transcribed audio {i+1}: {len(transcript_result.transcript)} characters")
+                    else:
+                        logger.error(f"Transcription failed for audio {i+1}: {transcript_result.error}")
+                    
+                    # Cleanup
+                    for path in [audio_file_path, converted_path]:
+                        if path and os.path.exists(path):
+                            os.remove(path)
+                            
+                except Exception as e:
+                    logger.error(f"Error processing audio {i+1}: {str(e)}")
+                    continue
+            
+            if not all_transcripts:
+                logger.error("No audio files were successfully transcribed")
+                return
+            
+            # Combine all transcripts
+            combined_transcript = "\n\n--- Audio Segment ---\n\n".join(all_transcripts)
+            logger.info(f"Combined transcript length: {len(combined_transcript)} characters")
+            
+            # Extract contact information from combined transcript
+            contact_info = self._extract_contact_info(combined_transcript)
+            
+            # Create Zoho Desk ticket with Canvas content and audio transcripts
+            ticket = await self._create_canvas_zoho_ticket(
+                canvas_data, combined_transcript, contact_info, file_info
+            )
+            
+            # Post feedback to Slack
+            if ticket:
+                await self._post_slack_feedback(file_info, ticket)
+            
+            # Mark file as completed
+            self.file_tracker.mark_file_processed(
+                file_info.file_url, file_info.file_name, file_info.user_id, file_info.channel_id,
+                status="completed", ticket_id=ticket.ticket_id if ticket else None
+            )
+            
+        except Exception as e:
+            logger.error(f"Error processing Canvas file: {str(e)}")
+    
+    async def _process_regular_audio_file(self, file_info: SlackFileInfo):
+        """Process regular audio file (non-Canvas)"""
         audio_file_path = None
         converted_audio_path = None
         
@@ -502,7 +705,7 @@ class SlackWebhookProcessor:
             )
             
         except Exception as e:
-            logger.error(f"Error in file processing pipeline: {str(e)}")
+            logger.error(f"Error in regular audio processing: {str(e)}")
         finally:
             # Cleanup temporary files
             for file_path in [audio_file_path, converted_audio_path]:
@@ -571,6 +774,123 @@ class SlackWebhookProcessor:
             logger.error(f"Error in audio conversion: {str(e)}")
             # Return original file as fallback
             return audio_file_path
+    
+    def _extract_file_id_from_url(self, file_url: str) -> Optional[str]:
+        """Extract file ID from Slack file URL"""
+        try:
+            # Extract file ID from URL pattern like: https://files.slack.com/files-pri/...
+            import re
+            match = re.search(r'/files-pri/[^/]+/([^/]+)/', file_url)
+            if match:
+                return match.group(1)
+            
+            # Alternative pattern
+            match = re.search(r'/files/([^/]+)/', file_url)
+            if match:
+                return match.group(1)
+            
+            logger.warning(f"Could not extract file ID from URL: {file_url}")
+            return None
+        except Exception as e:
+            logger.error(f"Error extracting file ID: {str(e)}")
+            return None
+    
+    async def _download_audio_from_url(self, audio_url: str, filename_prefix: str) -> Optional[str]:
+        """Download audio file from URL"""
+        try:
+            headers = {
+                'Authorization': f'Bearer {SLACK_BOT_TOKEN}'
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(audio_url, headers=headers) as response:
+                    if response.status == 200:
+                        # Create temporary file
+                        temp_file = tempfile.NamedTemporaryFile(
+                            delete=False, 
+                            suffix='.mp4',  # Default to MP4 for Canvas audio
+                            prefix=filename_prefix
+                        )
+                        temp_file.write(await response.read())
+                        temp_file.close()
+                        logger.info(f"Downloaded audio: {temp_file.name}")
+                        return temp_file.name
+                    else:
+                        logger.error(f"Failed to download audio: {response.status}")
+                        return None
+        except Exception as e:
+            logger.error(f"Error downloading audio from URL: {str(e)}")
+            return None
+    
+    async def _create_canvas_zoho_ticket(self, canvas_data: CanvasData, combined_transcript: str, contact_info: Dict[str, Optional[str]], file_info: SlackFileInfo) -> Optional[ZohoTicket]:
+        """Create Zoho Desk ticket for Canvas file with embedded audio"""
+        try:
+            # Get OAuth access token
+            access_token = await self.zoho_oauth.get_access_token()
+            if not access_token:
+                logger.error("No valid Zoho access token available")
+                return None
+            
+            url = f"https://{ZOHO_DESK_DOMAIN}/api/v1/tickets"
+            headers = self.zoho_oauth.get_headers()
+            
+            # Create comprehensive ticket description
+            description = f"""Canvas File: {file_info.file_name}
+
+Canvas Content:
+{canvas_data.canvas_text[:1000]}{'...' if len(canvas_data.canvas_text) > 1000 else ''}
+
+Audio Transcripts ({len(canvas_data.audio_links)} audio files):
+{combined_transcript}
+
+Source: Slack Canvas File
+Channel: {file_info.channel_id}
+User: {file_info.user_id}
+Timestamp: {file_info.timestamp}
+"""
+            
+            # Create ticket data
+            ticket_data = {
+                'subject': f'Canvas File with Audio - {file_info.file_name}',
+                'description': description,
+                'status': 'Open',
+                'priority': 'Medium',
+                'channel': 'Slack Canvas',
+                'source': 'Canvas File with Audio'
+            }
+            
+            # Add department if configured
+            if ZOHO_DESK_DEPARTMENT_ID:
+                ticket_data['departmentId'] = ZOHO_DESK_DEPARTMENT_ID
+            
+            # Add contact information if available
+            if contact_info.get('email'):
+                ticket_data['email'] = contact_info['email']
+            if contact_info.get('phone'):
+                ticket_data['phone'] = contact_info['phone']
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=ticket_data) as response:
+                    if response.status == 201:
+                        result = await response.json()
+                        ticket_id = result['data']['id']
+                        
+                        logger.info(f"Created Canvas Zoho ticket: {ticket_id}")
+                        return ZohoTicket(
+                            ticket_id=ticket_id,
+                            subject=ticket_data['subject'],
+                            status='Open',
+                            priority='Medium',
+                            contact_email=contact_info.get('email'),
+                            contact_phone=contact_info.get('phone')
+                        )
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Failed to create Canvas Zoho ticket: {response.status} - {error_text}")
+                        return None
+        except Exception as e:
+            logger.error(f"Error creating Canvas Zoho ticket: {str(e)}")
+            return None
     
     async def _transcribe_audio(self, audio_file_path: str) -> TranscriptionResult:
         """Transcribe audio using configured service"""
@@ -987,6 +1307,12 @@ def health():
             'ffmpeg_available': bool(processor.audio_converter.ffmpeg_path),
             'conversion_support': 'mp4_to_mp3',
             'supported_formats': ['mp3', 'mp4', 'wav', 'm4a', 'aac', 'ogg', 'flac']
+        },
+        'canvas_processing': {
+            'enabled': True,
+            'supported_types': ['canvas', 'application/vnd.slack.canvas'],
+            'audio_extraction': 'embedded_audio_links',
+            'multi_audio_support': True
         },
         'file_tracking': {
             'database': 'active',
