@@ -1,0 +1,24 @@
+# FastAPI requirements for Slack File Share Middleware
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+requests==2.31.0
+python-multipart==0.0.6
+
+# Optional: For enhanced performance
+httpx==0.25.2
+aiofiles==23.2.1
+
+# Environment management
+python-dotenv==1.0.0
+
+# Logging and monitoring
+structlog==23.2.0
+
+# Audio processing (optional)
+# pydub==0.25.1
+# librosa==0.10.1
+
+# Transcription services (choose one)
+# openai==1.3.0  # For Whisper
+# deepgram-sdk==2.7.0  # For Deepgram
+# assemblyai==0.18.0  # For AssemblyAI
