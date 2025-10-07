@@ -316,16 +316,21 @@ class CanvasParser:
     
     def is_canvas_file(self, file_type: str, mimetype: str = None) -> bool:
         """Check if file is a Slack Canvas file"""
-        canvas_indicators = [
-            'canvas',
-            'application/vnd.slack.canvas',
-            'text/canvas'
-        ]
+        # Check file type first (most reliable indicator)
+        if file_type and file_type.lower() in ['quip', 'canvas']:
+            return True
         
+        # Check MIME type as fallback
         if mimetype:
+            canvas_indicators = [
+                'canvas',
+                'application/vnd.slack.canvas',
+                'application/vnd.slack-docs',
+                'text/canvas'
+            ]
             return any(indicator in mimetype.lower() for indicator in canvas_indicators)
         
-        return file_type.lower() == 'canvas'
+        return False
 
 class AudioConverter:
     """Handles audio file conversion from MP4 to MP3"""
