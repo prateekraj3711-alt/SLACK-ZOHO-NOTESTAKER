@@ -13,7 +13,7 @@ import hashlib
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Union
 from dataclasses import dataclass
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, APIRouter
 from fastapi.responses import JSONResponse
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +28,9 @@ SLACK_SIGNING_SECRET = os.getenv('SLACK_SIGNING_SECRET')
 TRANSCRIPTION_API_KEY = os.getenv('TRANSCRIPTION_API_KEY')
 TRANSCRIPTION_PROVIDER = os.getenv('TRANSCRIPTION_PROVIDER', 'whisper')
 
+# Slack API configuration
+SLACK_API_BASE = "https://slack.com/api"
+
 # Audio file validation
 AUDIO_MIME_TYPES = {
     'audio/mpeg': '.mp3',
@@ -41,6 +44,61 @@ AUDIO_MIME_TYPES = {
 }
 
 AUDIO_EXTENSIONS = ['.mp3', '.wav', '.m4a', '.ogg', '.webm', '.mp4', '.aac', '.flac']
+
+# Canvas-specific functions
+def get_canvas_info(canvas_id: str, token: str) -> Optional[Dict[str, Any]]:
+    """Get Canvas information from Slack API"""
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(f"{SLACK_API_BASE}/canvas.info?canvas_id={canvas_id}", headers=headers)
+        if resp.ok:
+            return resp.json()
+        else:
+            logger.error(f"Canvas info failed: {resp.status_code} - {resp.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Error fetching Canvas info: {str(e)}")
+        return None
+
+def extract_audio_links(canvas_json: Dict[str, Any]) -> List[str]:
+    """Extract audio links from Canvas block structure"""
+    audio_links = []
+    blocks = canvas_json.get("canvas", {}).get("blocks", [])
+    
+    for block in blocks:
+        if block.get("type") == "file":
+            file = block.get("file", {})
+            url = file.get("url_private_download", "")
+            if url.endswith((".mp3", ".m4a", ".wav", ".mp4", ".ogg", ".webm")):
+                audio_links.append(url)
+                logger.info(f"Found audio file in Canvas: {url}")
+        elif block.get("type") == "rich_text":
+            for el in block.get("elements", []):
+                if el.get("type") == "link" and el.get("url", "").endswith((".mp3", ".m4a", ".wav", ".mp4", ".ogg", ".webm")):
+                    audio_links.append(el["url"])
+                    logger.info(f"Found audio link in Canvas: {el['url']}")
+    
+    logger.info(f"Extracted {len(audio_links)} audio links from Canvas")
+    return audio_links
+
+def download_audio(url: str, token: str, save_path: str) -> Optional[str]:
+    """Download audio file securely with bot token"""
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(url, headers=headers, stream=True, timeout=60)
+        if resp.ok:
+            with open(save_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            logger.info(f"Audio saved to {save_path}")
+            return save_path
+        else:
+            logger.error(f"Audio download failed: {resp.status_code} - {resp.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Error downloading audio: {str(e)}")
+        return None
 
 @dataclass
 class SlackFileMetadata:
@@ -319,78 +377,152 @@ async def health():
     }
 
 @app.post("/webhook/slack")
-async def slack_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Main webhook endpoint for Slack events"""
+async def slack_webhook(request: Request):
+    """Main webhook endpoint for Slack events with Canvas support"""
     try:
         # Parse request body
-        body = await request.body()
-        payload = json.loads(body)
+        payload = await request.json()
         
-        logger.info(f"Received Slack event: {payload.get('type', 'unknown')}")
+        logger.info(f"Received webhook payload: {json.dumps(payload, indent=2)}")
         
-        # Handle different event types
-        event_type = payload.get('type')
+        # Extract key information
+        file_type = payload.get("file_type")
+        file_id = payload.get("file_id")
+        slack_token = payload.get("slack_token", SLACK_BOT_TOKEN)
         
-        if event_type == 'url_verification':
-            # Slack URL verification
-            return {"challenge": payload.get('challenge')}
-        
-        elif event_type == 'event_callback':
-            # Process event
-            event = payload.get('event', {})
-            event_subtype = event.get('type')
+        # Handle Canvas files (quip type)
+        if file_type == "quip":
+            logger.info(f"Processing Canvas file: {file_id}")
             
-            if event_subtype == 'file_shared':
-                # Handle file share event
-                logger.info("Processing file_shared event")
-                result = file_processor.process_file_share_event(event)
+            # Get Canvas information
+            canvas_json = get_canvas_info(file_id, slack_token)
+            if not canvas_json:
+                logger.error("Canvas fetch failed")
+                return {"status": "canvas fetch failed", "error": "Could not retrieve Canvas information"}
+            
+            # Extract audio links from Canvas
+            audio_links = extract_audio_links(canvas_json)
+            if not audio_links:
+                logger.info("No audio links found in Canvas")
+                return {"status": "no audio found", "message": "Canvas contains no audio files"}
+            
+            # Download each audio file
+            downloaded_files = []
+            for i, url in enumerate(audio_links):
+                # Create unique filename
+                file_extension = os.path.splitext(url.split('/')[-1])[1] or '.m4a'
+                save_path = os.path.join(
+                    file_processor.download_dir, 
+                    f"audio_{file_id}_{i}{file_extension}"
+                )
                 
-                if result.success:
-                    logger.info(f"Successfully processed file: {result.local_path}")
-                    return {
-                        "success": True,
-                        "message": "File processed successfully",
-                        "file_path": result.local_path,
-                        "file_size": result.file_size
-                    }
+                # Download audio file
+                result_path = download_audio(url, slack_token, save_path)
+                if result_path:
+                    downloaded_files.append({
+                        "index": i,
+                        "url": url,
+                        "local_path": result_path,
+                        "file_size": os.path.getsize(result_path) if os.path.exists(result_path) else 0
+                    })
+                    logger.info(f"Downloaded audio {i+1}/{len(audio_links)}: {result_path}")
                 else:
-                    logger.error(f"Failed to process file: {result.error}")
-                    return {
-                        "success": False,
-                        "error": result.error
-                    }
+                    logger.error(f"Failed to download audio {i+1}/{len(audio_links)}: {url}")
             
-            elif event_subtype == 'message' and event.get('files'):
-                # Handle message with file attachments
-                logger.info("Processing message with file attachments")
-                results = []
-                
-                for file_data in event.get('files', []):
-                    file_id = file_data.get('id')
-                    if file_id:
-                        # Create event-like structure
-                        file_event = {'file': file_data}
-                        result = file_processor.process_file_share_event(file_event)
-                        results.append({
-                            "file_id": file_id,
-                            "success": result.success,
-                            "file_path": result.local_path if result.success else None,
-                            "error": result.error if not result.success else None
-                        })
-                
+            if downloaded_files:
+                logger.info(f"Successfully downloaded {len(downloaded_files)} audio files from Canvas")
                 return {
-                    "success": True,
-                    "message": f"Processed {len(results)} files",
-                    "results": results
+                    "status": "audio extracted",
+                    "canvas_id": file_id,
+                    "audio_count": len(audio_links),
+                    "downloaded_count": len(downloaded_files),
+                    "files": downloaded_files
+                }
+            else:
+                logger.error("Failed to download any audio files from Canvas")
+                return {
+                    "status": "download failed",
+                    "error": "Could not download any audio files from Canvas"
                 }
         
-        # Event not handled
-        logger.info(f"Unhandled event type: {event_type}")
-        return {"message": "Event received but not processed"}
+        # Handle regular file events (non-Canvas)
+        elif file_type in ["mp3", "mp4", "wav", "m4a", "ogg", "webm"]:
+            logger.info(f"Processing regular audio file: {file_id}")
+            
+            # Use existing file processor for regular files
+            result = file_processor.process_file_share_event(payload)
+            
+            if result.success:
+                logger.info(f"Successfully processed regular file: {result.local_path}")
+                return {
+                    "status": "file processed",
+                    "file_id": file_id,
+                    "file_path": result.local_path,
+                    "file_size": result.file_size
+                }
+            else:
+                logger.error(f"Failed to process regular file: {result.error}")
+                return {
+                    "status": "processing failed",
+                    "error": result.error
+                }
+        
+        # Handle Slack event callbacks (for direct Slack webhooks)
+        elif payload.get('type') == 'event_callback':
+            event = payload.get('event', {})
+            event_type = event.get('type')
+            
+            if event_type == 'file_shared':
+                file_data = event.get('file', {})
+                file_id = file_data.get('id')
+                file_type = file_data.get('filetype', '')
+                
+                logger.info(f"Processing Slack file_shared event: {file_id} (type: {file_type})")
+                
+                # Check if it's a Canvas file
+                if file_type == 'quip':
+                    return await slack_webhook(Request(
+                        scope={'type': 'http'},
+                        receive=lambda: {'type': 'http.request', 'body': json.dumps({
+                            "file_type": "quip",
+                            "file_id": file_id,
+                            "slack_token": SLACK_BOT_TOKEN
+                        }).encode()}
+                    ))
+                else:
+                    # Process as regular file
+                    result = file_processor.process_file_share_event(event)
+                    if result.success:
+                        return {
+                            "status": "file processed",
+                            "file_id": file_id,
+                            "file_path": result.local_path,
+                            "file_size": result.file_size
+                        }
+                    else:
+                        return {
+                            "status": "processing failed",
+                            "error": result.error
+                        }
+        
+        # Handle URL verification
+        elif payload.get('type') == 'url_verification':
+            return {"challenge": payload.get('challenge')}
+        
+        # Unhandled event type
+        else:
+            logger.info(f"Non-Canvas file or unhandled event received: {file_type}")
+            return {
+                "status": "ignored",
+                "message": f"File type '{file_type}' not supported or no processing needed"
+            }
         
     except Exception as e:
         logger.error(f"Webhook error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "status": "error",
+            "error": str(e)
+        }
 
 @app.get("/download/{file_id}")
 async def download_file(file_id: str):

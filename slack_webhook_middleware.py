@@ -525,12 +525,38 @@ class SlackWebhookProcessor:
             file_type = file_info.get('filetype', 'unknown')
             mimetype = file_info.get('mimetype', '')
             
+            # Log the payload for debugging
+            logger.info(f"Extracting file info from payload: file_type={file_type} (type: {type(file_type)}), mimetype={mimetype}")
+            logger.info(f"File info keys: {list(file_info.keys())}")
+            logger.info(f"Full file_info: {file_info}")
+            
+            # Ensure file_type is a string with better handling
+            if file_type is None:
+                file_type = 'unknown'
+            elif not isinstance(file_type, str):
+                file_type = str(file_type)
+            
+            # Clean up the file_type
+            file_type = file_type.strip() if file_type else 'unknown'
+            if file_type == 'None' or file_type == 'null':
+                file_type = 'unknown'
+            
             # Check if it's a Canvas file
             is_canvas = self.canvas_parser.is_canvas_file(file_type, mimetype)
             
+            # Validate required fields
+            file_url = file_info.get('url_private')
+            if not file_url:
+                logger.error("Missing url_private in file_info")
+                return None
+            
+            file_name = file_info.get('name', 'unknown')
+            if not isinstance(file_name, str):
+                file_name = str(file_name) if file_name is not None else 'unknown'
+            
             return SlackFileInfo(
-                file_url=file_info.get('url_private'),
-                file_name=file_info.get('name', 'unknown'),
+                file_url=file_url,
+                file_name=file_name,
                 user_id=payload.get('user_id'),
                 channel_id=payload.get('channel_id'),
                 timestamp=payload.get('timestamp', str(datetime.now().timestamp())),
@@ -540,6 +566,7 @@ class SlackWebhookProcessor:
             )
         except Exception as e:
             logger.error(f"Error extracting file info: {str(e)}")
+            logger.error(f"Payload structure: {json.dumps(payload, indent=2)}")
             return None
     
     def _process_file_async(self, file_info: SlackFileInfo):
@@ -719,6 +746,18 @@ class SlackWebhookProcessor:
     async def _download_slack_file(self, file_info: SlackFileInfo) -> Optional[str]:
         """Download audio file from Slack"""
         try:
+            # Validate file_info
+            if not file_info:
+                logger.error("file_info is None")
+                return None
+            
+            if not file_info.file_url:
+                logger.error("file_info.file_url is None or empty")
+                return None
+            
+            logger.info(f"Downloading file: {file_info.file_name} (type: {file_info.file_type})")
+            logger.info(f"File info details: name={file_info.file_name}, type={file_info.file_type}, url={file_info.file_url[:50]}...")
+            
             headers = {
                 'Authorization': f'Bearer {SLACK_BOT_TOKEN}'
             }
@@ -726,20 +765,52 @@ class SlackWebhookProcessor:
             async with aiohttp.ClientSession() as session:
                 async with session.get(file_info.file_url, headers=headers) as response:
                     if response.status == 200:
-                        # Create temporary file with original extension
-                        temp_file = tempfile.NamedTemporaryFile(
-                            delete=False, 
-                            suffix=f'.{file_info.file_type}'
-                        )
-                        temp_file.write(await response.read())
+                        # Create temporary file with safe extension
+                        # Always default to mp4 for audio files to avoid constructor errors
+                        safe_file_type = 'mp4'
+                        
+                        # Try to use original file type if it's valid
+                        if file_info.file_type and isinstance(file_info.file_type, str):
+                            original_type = str(file_info.file_type).strip()
+                            if (original_type and 
+                                original_type != 'None' and 
+                                original_type != 'unknown' and 
+                                original_type != 'null' and
+                                original_type != ''):
+                                # Only use original type if it looks like a valid extension
+                                if (len(original_type) <= 10 and 
+                                    not any(char in original_type for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']) and
+                                    original_type.isalnum() or original_type in ['mp3', 'mp4', 'wav', 'm4a', 'ogg', 'webm']):
+                                    safe_file_type = original_type
+                        
+                        logger.info(f"Creating temp file with suffix: .{safe_file_type}")
+                        
+                        # Final safety check for the suffix
+                        try:
+                            temp_file = tempfile.NamedTemporaryFile(
+                                delete=False, 
+                                suffix=f'.{safe_file_type}'
+                            )
+                        except Exception as suffix_error:
+                            logger.error(f"Error creating temp file with suffix .{safe_file_type}: {suffix_error}")
+                            # Fallback to no suffix
+                            temp_file = tempfile.NamedTemporaryFile(delete=False)
+                        
+                        # Write file content
+                        content = await response.read()
+                        temp_file.write(content)
                         temp_file.close()
-                        logger.info(f"Downloaded file: {temp_file.name}")
+                        
+                        logger.info(f"Downloaded file: {temp_file.name} ({len(content)} bytes)")
                         return temp_file.name
                     else:
                         logger.error(f"Failed to download file: {response.status}")
+                        error_text = await response.text()
+                        logger.error(f"Error response: {error_text}")
                         return None
         except Exception as e:
             logger.error(f"Error downloading Slack file: {str(e)}")
+            logger.error(f"File info: {file_info}")
             return None
     
     async def _convert_audio_if_needed(self, audio_file_path: str, file_info: SlackFileInfo) -> Optional[str]:
@@ -805,11 +876,15 @@ class SlackWebhookProcessor:
             async with aiohttp.ClientSession() as session:
                 async with session.get(audio_url, headers=headers) as response:
                     if response.status == 200:
-                        # Create temporary file
+                        # Create temporary file with safe parameters
+                        safe_prefix = str(filename_prefix).strip() if filename_prefix else 'audio'
+                        if not safe_prefix:
+                            safe_prefix = 'audio'
+                        
                         temp_file = tempfile.NamedTemporaryFile(
                             delete=False, 
                             suffix='.mp4',  # Default to MP4 for Canvas audio
-                            prefix=filename_prefix
+                            prefix=f"{safe_prefix}_"
                         )
                         temp_file.write(await response.read())
                         temp_file.close()
@@ -1334,6 +1409,13 @@ def slack_webhook():
         
         logger.info(f"Received webhook: {json.dumps(payload, indent=2)}")
         
+        # Debug: Log payload structure
+        logger.info(f"Payload keys: {list(payload.keys())}")
+        if 'file_info' in payload:
+            logger.info(f"File info keys: {list(payload['file_info'].keys())}")
+            logger.info(f"File type: {payload['file_info'].get('filetype')} (type: {type(payload['file_info'].get('filetype'))})")
+            logger.info(f"File name: {payload['file_info'].get('name')} (type: {type(payload['file_info'].get('name'))})")
+        
         # Process webhook asynchronously
         result = asyncio.run(processor.process_slack_webhook(payload))
         
@@ -1344,9 +1426,42 @@ def slack_webhook():
             
     except Exception as e:
         logger.error(f"Webhook error: {str(e)}")
+        logger.error(f"Payload that caused error: {json.dumps(payload, indent=2) if 'payload' in locals() else 'No payload'}")
         return jsonify({
             'success': False,
             'error': f'Internal server error: {str(e)}'
+        }), 500
+
+@app.route('/debug/payload', methods=['POST'])
+def debug_payload():
+    """Debug endpoint to test payload parsing"""
+    try:
+        payload = request.get_json()
+        if not payload:
+            return jsonify({'error': 'No JSON payload received'}), 400
+        
+        # Test file info extraction
+        file_info = payload.get('file_info', {})
+        file_type = file_info.get('filetype', 'unknown')
+        file_name = file_info.get('name', 'unknown')
+        
+        return jsonify({
+            'success': True,
+            'debug_info': {
+                'file_type': file_type,
+                'file_type_class': str(type(file_type)),
+                'file_name': file_name,
+                'file_name_class': str(type(file_name)),
+                'file_url': file_info.get('url_private'),
+                'payload_keys': list(payload.keys()),
+                'file_info_keys': list(file_info.keys())
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
         }), 500
 
 if __name__ == '__main__':
