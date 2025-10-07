@@ -58,6 +58,7 @@ class SlackFileInfo:
     file_type: str
     is_canvas: bool = False
     canvas_audio_links: list = None
+    file_id: str = None
 
 @dataclass
 class CanvasData:
@@ -559,6 +560,9 @@ class SlackWebhookProcessor:
             if not isinstance(file_name, str):
                 file_name = str(file_name) if file_name is not None else 'unknown'
             
+            # Extract file_id for Canvas processing
+            file_id = file_info.get('id') or payload.get('file_id')
+            
             return SlackFileInfo(
                 file_url=file_url,
                 file_name=file_name,
@@ -567,7 +571,8 @@ class SlackWebhookProcessor:
                 timestamp=payload.get('timestamp', str(datetime.now().timestamp())),
                 file_type=file_type,
                 is_canvas=is_canvas,
-                canvas_audio_links=[]
+                canvas_audio_links=[],
+                file_id=file_id
             )
         except Exception as e:
             logger.error(f"Error extracting file info: {str(e)}")
@@ -593,7 +598,7 @@ class SlackWebhookProcessor:
         try:
             if file_info.is_canvas:
                 # Handle Canvas file with embedded audio
-                await self._process_canvas_file(file_info)
+                await self._process_canvas_file(file_info, file_info.file_id)
             else:
                 # Handle regular audio file
                 await self._process_regular_audio_file(file_info)
@@ -610,16 +615,17 @@ class SlackWebhookProcessor:
                     except Exception as e:
                         logger.warning(f"Failed to cleanup file {file_path}: {str(e)}")
     
-    async def _process_canvas_file(self, file_info: SlackFileInfo):
+    async def _process_canvas_file(self, file_info: SlackFileInfo, file_id: str = None):
         """Process Canvas file with embedded audio"""
         try:
-            # Extract file ID from URL or payload
-            file_id = self._extract_file_id_from_url(file_info.file_url)
+            # Use provided file_id or extract from URL
             if not file_id:
-                logger.error(f"Could not extract file ID from URL: {file_info.file_url}")
-                return
+                file_id = self._extract_file_id_from_url(file_info.file_url)
+                if not file_id:
+                    logger.error(f"Could not extract file ID from URL: {file_info.file_url}")
+                    return
             
-            # Parse Canvas file
+            # Parse Canvas file using file_id directly
             canvas_data = self.canvas_parser.download_and_parse_canvas(file_id)
             if not canvas_data:
                 logger.error(f"Failed to parse Canvas file: {file_info.file_name}")
