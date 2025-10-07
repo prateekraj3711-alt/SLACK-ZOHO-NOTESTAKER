@@ -15,6 +15,8 @@ import re
 import hashlib
 import sqlite3
 import requests
+import subprocess
+import shutil
 from datetime import datetime
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
@@ -235,6 +237,130 @@ class ZohoOAuthManager:
             "Content-Type": "application/json"
         }
 
+class AudioConverter:
+    """Handles audio file conversion from MP4 to MP3"""
+    
+    def __init__(self):
+        self.ffmpeg_path = self._find_ffmpeg()
+    
+    def _find_ffmpeg(self) -> Optional[str]:
+        """Find FFmpeg executable in system PATH"""
+        try:
+            # Check if ffmpeg is in PATH
+            result = subprocess.run(['ffmpeg', '-version'], 
+                                 capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                return 'ffmpeg'
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        
+        # Check common installation paths
+        common_paths = [
+            'C:\\ffmpeg\\bin\\ffmpeg.exe',
+            'C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe',
+            'C:\\Program Files (x86)\\ffmpeg\\bin\\ffmpeg.exe',
+            '/usr/bin/ffmpeg',
+            '/usr/local/bin/ffmpeg'
+        ]
+        
+        for path in common_paths:
+            if os.path.exists(path):
+                return path
+        
+        logger.warning("FFmpeg not found in PATH or common locations")
+        return None
+    
+    def is_audio_file(self, file_path: str) -> bool:
+        """Check if file is an audio file using FFprobe"""
+        try:
+            if not self.ffmpeg_path:
+                # Fallback: check file extension
+                audio_extensions = ['.mp3', '.mp4', '.wav', '.m4a', '.aac', '.ogg', '.flac']
+                return any(file_path.lower().endswith(ext) for ext in audio_extensions)
+            
+            # Use ffprobe to detect audio streams
+            cmd = [
+                self.ffmpeg_path.replace('ffmpeg', 'ffprobe'),
+                '-v', 'quiet',
+                '-select_streams', 'a',
+                '-show_entries', 'stream=codec_type',
+                '-of', 'csv=p=0',
+                file_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            return 'audio' in result.stdout.lower()
+            
+        except Exception as e:
+            logger.error(f"Error checking audio file: {str(e)}")
+            # Fallback to extension check
+            audio_extensions = ['.mp3', '.mp4', '.wav', '.m4a', '.aac', '.ogg', '.flac']
+            return any(file_path.lower().endswith(ext) for ext in audio_extensions)
+    
+    def convert_to_mp3(self, input_path: str, output_path: str = None) -> Optional[str]:
+        """Convert audio file to MP3 format"""
+        try:
+            if not self.ffmpeg_path:
+                logger.error("FFmpeg not available for audio conversion")
+                return None
+            
+            if not output_path:
+                # Create output path with .mp3 extension
+                base_name = os.path.splitext(input_path)[0]
+                output_path = f"{base_name}_converted.mp3"
+            
+            # FFmpeg command for audio conversion
+            cmd = [
+                self.ffmpeg_path,
+                '-i', input_path,
+                '-acodec', 'mp3',
+                '-ab', '128k',  # 128 kbps bitrate
+                '-ar', '44100',  # 44.1 kHz sample rate
+                '-y',  # Overwrite output file
+                output_path
+            ]
+            
+            logger.info(f"Converting audio: {input_path} -> {output_path}")
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
+            if result.returncode == 0 and os.path.exists(output_path):
+                logger.info(f"Audio conversion successful: {output_path}")
+                return output_path
+            else:
+                logger.error(f"Audio conversion failed: {result.stderr}")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            logger.error("Audio conversion timed out")
+            return None
+        except Exception as e:
+            logger.error(f"Error converting audio: {str(e)}")
+            return None
+    
+    def get_audio_duration(self, file_path: str) -> Optional[float]:
+        """Get audio file duration in seconds"""
+        try:
+            if not self.ffmpeg_path:
+                return None
+            
+            cmd = [
+                self.ffmpeg_path.replace('ffmpeg', 'ffprobe'),
+                '-v', 'quiet',
+                '-show_entries', 'format=duration',
+                '-of', 'csv=p=0',
+                file_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                return float(result.stdout.strip())
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting audio duration: {str(e)}")
+            return None
+
 class SlackWebhookProcessor:
     """Main processor for handling Slack webhook requests"""
     
@@ -242,6 +368,7 @@ class SlackWebhookProcessor:
         self.executor = ThreadPoolExecutor(max_workers=5)
         self.file_tracker = FileTracker()
         self.zoho_oauth = ZohoOAuthManager()
+        self.audio_converter = AudioConverter()
     
     async def process_slack_webhook(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Process incoming Slack webhook from Zapier"""
@@ -329,22 +456,42 @@ class SlackWebhookProcessor:
     
     async def _async_process_file(self, file_info: SlackFileInfo):
         """Async file processing pipeline"""
+        audio_file_path = None
+        converted_audio_path = None
+        
         try:
-            # Step 1: Transcribe audio directly from URL
-            transcript_result = await self._transcribe_audio_url(file_info.file_url)
+            # Step 1: Download audio file from Slack
+            audio_file_path = await self._download_slack_file(file_info)
+            if not audio_file_path:
+                logger.error(f"Failed to download file: {file_info.file_name}")
+                return
+            
+            # Step 2: Check if file is audio and convert if needed
+            if not self.audio_converter.is_audio_file(audio_file_path):
+                logger.warning(f"File may not be audio: {file_info.file_name}")
+                # Continue anyway, let transcription service handle it
+            
+            # Step 3: Convert to MP3 if needed
+            converted_audio_path = await self._convert_audio_if_needed(audio_file_path, file_info)
+            if not converted_audio_path:
+                logger.error(f"Audio conversion failed for: {file_info.file_name}")
+                return
+            
+            # Step 4: Transcribe audio
+            transcript_result = await self._transcribe_audio(converted_audio_path)
             if not transcript_result.success:
                 logger.error(f"Transcription failed: {transcript_result.error}")
                 return
             
-            # Step 2: Extract contact information
+            # Step 5: Extract contact information
             contact_info = self._extract_contact_info(transcript_result.transcript)
             
-            # Step 3: Search/create Zoho Desk ticket
+            # Step 6: Search/create Zoho Desk ticket
             ticket = await self._handle_zoho_desk_ticket(
                 transcript_result.transcript, contact_info, file_info
             )
             
-            # Step 4: Post feedback to Slack (optional)
+            # Step 7: Post feedback to Slack (optional)
             if ticket:
                 await self._post_slack_feedback(file_info, ticket)
             
@@ -353,9 +500,18 @@ class SlackWebhookProcessor:
                 file_info.file_url, file_info.file_name, file_info.user_id, file_info.channel_id,
                 status="completed", ticket_id=ticket.ticket_id if ticket else None
             )
-                
+            
         except Exception as e:
             logger.error(f"Error in file processing pipeline: {str(e)}")
+        finally:
+            # Cleanup temporary files
+            for file_path in [audio_file_path, converted_audio_path]:
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        logger.info(f"Cleaned up temporary file: {file_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to cleanup file {file_path}: {str(e)}")
     
     async def _download_slack_file(self, file_info: SlackFileInfo) -> Optional[str]:
         """Download audio file from Slack"""
@@ -367,7 +523,7 @@ class SlackWebhookProcessor:
             async with aiohttp.ClientSession() as session:
                 async with session.get(file_info.file_url, headers=headers) as response:
                     if response.status == 200:
-                        # Create temporary file
+                        # Create temporary file with original extension
                         temp_file = tempfile.NamedTemporaryFile(
                             delete=False, 
                             suffix=f'.{file_info.file_type}'
@@ -383,26 +539,41 @@ class SlackWebhookProcessor:
             logger.error(f"Error downloading Slack file: {str(e)}")
             return None
     
-    async def _transcribe_audio_url(self, audio_url: str) -> TranscriptionResult:
-        """Transcribe audio directly from URL using configured service"""
+    async def _convert_audio_if_needed(self, audio_file_path: str, file_info: SlackFileInfo) -> Optional[str]:
+        """Convert audio file to MP3 if needed"""
         try:
-            if TRANSCRIPTION_PROVIDER == 'deepgram':
-                return await self._transcribe_url_with_deepgram(audio_url)
-            elif TRANSCRIPTION_PROVIDER == 'assemblyai':
-                return await self._transcribe_url_with_assemblyai(audio_url)
-            elif TRANSCRIPTION_PROVIDER == 'whisper':
-                return await self._transcribe_url_with_whisper(audio_url)
+            # Check if file is already MP3
+            if audio_file_path.lower().endswith('.mp3'):
+                logger.info(f"File is already MP3: {file_info.file_name}")
+                return audio_file_path
+            
+            # Check if conversion is needed
+            if not self.audio_converter.is_audio_file(audio_file_path):
+                logger.warning(f"File may not be audio, attempting conversion anyway: {file_info.file_name}")
+            
+            # Convert to MP3
+            converted_path = self.audio_converter.convert_to_mp3(audio_file_path)
+            
+            if converted_path and os.path.exists(converted_path):
+                # Get audio duration for logging
+                duration = self.audio_converter.get_audio_duration(converted_path)
+                if duration:
+                    logger.info(f"Audio conversion successful: {file_info.file_name} ({duration:.2f}s)")
+                else:
+                    logger.info(f"Audio conversion successful: {file_info.file_name}")
+                return converted_path
             else:
-                return TranscriptionResult(
-                    success=False,
-                    error=f"Unsupported transcription provider: {TRANSCRIPTION_PROVIDER}"
-                )
+                logger.error(f"Audio conversion failed for: {file_info.file_name}")
+                # Return original file as fallback
+                return audio_file_path
+                
         except Exception as e:
-            logger.error(f"Transcription error: {str(e)}")
-            return TranscriptionResult(success=False, error=str(e))
+            logger.error(f"Error in audio conversion: {str(e)}")
+            # Return original file as fallback
+            return audio_file_path
     
     async def _transcribe_audio(self, audio_file_path: str) -> TranscriptionResult:
-        """Transcribe audio file using configured service (legacy method)"""
+        """Transcribe audio using configured service"""
         try:
             if TRANSCRIPTION_PROVIDER == 'deepgram':
                 return await self._transcribe_with_deepgram(audio_file_path)
@@ -419,48 +590,8 @@ class SlackWebhookProcessor:
             logger.error(f"Transcription error: {str(e)}")
             return TranscriptionResult(success=False, error=str(e))
     
-    async def _transcribe_url_with_deepgram(self, audio_url: str) -> TranscriptionResult:
-        """Transcribe audio URL using Deepgram API"""
-        try:
-            url = "https://api.deepgram.com/v1/listen"
-            headers = {
-                'Authorization': f'Token {TRANSCRIPTION_API_KEY}',
-                'Content-Type': 'application/json'
-            }
-            
-            # Add authentication headers for Slack file access
-            auth_headers = {
-                'Authorization': f'Bearer {SLACK_BOT_TOKEN}'
-            }
-            
-            data = {
-                'url': audio_url,
-                'punctuate': 'true',
-                'smart_format': 'true'
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=data) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        transcript = result['results']['channels'][0]['alternatives'][0]['transcript']
-                        confidence = result['results']['channels'][0]['alternatives'][0]['confidence']
-                        return TranscriptionResult(
-                            success=True,
-                            transcript=transcript,
-                            confidence=confidence
-                        )
-                    else:
-                        error_text = await response.text()
-                        return TranscriptionResult(
-                            success=False,
-                            error=f"Deepgram API error: {response.status} - {error_text}"
-                        )
-        except Exception as e:
-            return TranscriptionResult(success=False, error=str(e))
-    
     async def _transcribe_with_deepgram(self, audio_file_path: str) -> TranscriptionResult:
-        """Transcribe using Deepgram API (legacy method)"""
+        """Transcribe using Deepgram API"""
         try:
             url = "https://api.deepgram.com/v1/listen"
             headers = {
@@ -489,31 +620,8 @@ class SlackWebhookProcessor:
         except Exception as e:
             return TranscriptionResult(success=False, error=str(e))
     
-    async def _transcribe_url_with_assemblyai(self, audio_url: str) -> TranscriptionResult:
-        """Transcribe audio URL using AssemblyAI API"""
-        try:
-            headers = {'authorization': TRANSCRIPTION_API_KEY}
-            
-            # Start transcription directly with URL
-            transcribe_url = "https://api.assemblyai.com/v2/transcript"
-            transcribe_data = {'audio_url': audio_url}
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(transcribe_url, headers=headers, json=transcribe_data) as response:
-                    if response.status == 200:
-                        transcribe_result = await response.json()
-                        transcript_id = transcribe_result['id']
-                        
-                        # Poll for completion
-                        return await self._poll_assemblyai_transcription(session, headers, transcript_id)
-                    else:
-                        error_text = await response.text()
-                        return TranscriptionResult(success=False, error=f"AssemblyAI API error: {response.status} - {error_text}")
-        except Exception as e:
-            return TranscriptionResult(success=False, error=str(e))
-    
     async def _transcribe_with_assemblyai(self, audio_file_path: str) -> TranscriptionResult:
-        """Transcribe using AssemblyAI API (legacy method)"""
+        """Transcribe using AssemblyAI API"""
         try:
             # Upload file
             upload_url = "https://api.assemblyai.com/v2/upload"
@@ -571,44 +679,8 @@ class SlackWebhookProcessor:
                 else:
                     return TranscriptionResult(success=False, error="Failed to poll transcription status")
     
-    async def _transcribe_url_with_whisper(self, audio_url: str) -> TranscriptionResult:
-        """Transcribe audio URL using OpenAI Whisper API"""
-        try:
-            # Note: OpenAI Whisper doesn't support direct URL transcription
-            # We need to download the file first, then transcribe
-            logger.info("Whisper doesn't support URL transcription, downloading file first")
-            
-            # Download the audio file
-            headers = {'Authorization': f'Bearer {SLACK_BOT_TOKEN}'}
-            async with aiohttp.ClientSession() as session:
-                async with session.get(audio_url, headers=headers) as response:
-                    if response.status == 200:
-                        audio_data = await response.read()
-                        
-                        # Create temporary file
-                        import tempfile
-                        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_file:
-                            temp_file.write(audio_data)
-                            temp_file_path = temp_file.name
-                        
-                        try:
-                            # Transcribe the temporary file
-                            result = await self._transcribe_with_whisper(temp_file_path)
-                            return result
-                        finally:
-                            # Clean up temporary file
-                            if os.path.exists(temp_file_path):
-                                os.remove(temp_file_path)
-                    else:
-                        return TranscriptionResult(
-                            success=False,
-                            error=f"Failed to download audio: {response.status}"
-                        )
-        except Exception as e:
-            return TranscriptionResult(success=False, error=str(e))
-    
     async def _transcribe_with_whisper(self, audio_file_path: str) -> TranscriptionResult:
-        """Transcribe using OpenAI Whisper API (legacy method)"""
+        """Transcribe using OpenAI Whisper API"""
         try:
             url = "https://api.openai.com/v1/audio/transcriptions"
             headers = {
@@ -910,6 +982,11 @@ def health():
             'slack': bool(SLACK_BOT_TOKEN),
             'zoho': bool(ZOHO_DESK_ACCESS_TOKEN and ZOHO_DESK_REFRESH_TOKEN),
             'transcription': bool(TRANSCRIPTION_API_KEY)
+        },
+        'audio_processing': {
+            'ffmpeg_available': bool(processor.audio_converter.ffmpeg_path),
+            'conversion_support': 'mp4_to_mp3',
+            'supported_formats': ['mp3', 'mp4', 'wav', 'm4a', 'aac', 'ogg', 'flac']
         },
         'file_tracking': {
             'database': 'active',
