@@ -3,7 +3,7 @@ services:
     name: slack-webhook-middleware
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn slack_webhook_middleware:app --bind 0.0.0.0:$PORT --workers 4 --timeout 120
+    startCommand: python main.py
     healthCheckPath: /health
     envVars:
       - key: SLACK_BOT_TOKEN
