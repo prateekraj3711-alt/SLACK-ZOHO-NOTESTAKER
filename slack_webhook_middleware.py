@@ -854,13 +854,19 @@ class SlackWebhookProcessor:
     def _extract_file_id_from_url(self, file_url: str) -> Optional[str]:
         """Extract file ID from Slack file URL"""
         try:
-            # Extract file ID from URL pattern like: https://files.slack.com/files-pri/...
             import re
-            match = re.search(r'/files-pri/[^/]+/([^/]+)/', file_url)
+            
+            # Pattern for Canvas files: /files-pri/TEAM_ID-FILE_ID/canvas
+            match = re.search(r'/files-pri/[^-]+-([^/]+)/canvas', file_url)
             if match:
                 return match.group(1)
             
-            # Alternative pattern
+            # Pattern for regular files: /files-pri/TEAM_ID-FILE_ID/filename
+            match = re.search(r'/files-pri/[^-]+-([^/]+)/', file_url)
+            if match:
+                return match.group(1)
+            
+            # Alternative pattern for other file types
             match = re.search(r'/files/([^/]+)/', file_url)
             if match:
                 return match.group(1)
